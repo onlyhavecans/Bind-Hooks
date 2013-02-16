@@ -1,0 +1,152 @@
+#!/usr/bin/perl
+
+#I'm breaking everything out in to subs to contain vars and make it easier to read
+
+use strict;
+use warnings;
+use File::Spec;
+
+select(STDERR);
+
+my ($repo, $txn)=@ARGV;
+my $svnlook='/opt/csvn/bin/svnlook';
+my $chkzone='/usr/sbin/named-checkzone';
+my @chkflags=qw/ -ifull -kfail -mfail -Mfail -nfail -Sfail -Wfail /; #The flags to chkzone DON'T put -q in here!
+my $tmpfile=`mktemp`;
+my $minchars="15"; #The minimum size for a commit log
+my $failures=0; #When I use this method EVERYTHING gets tested before it dies and debugging is easier.
+my $date=0; #This should be YYYYMMDD but is set in main, not declaration to be done sanely.
+
+# Make sure that the log message contains some text.
+sub check_comment {
+	my $comment = `$svnlook log -t "$txn" "$repo"`;
+	if ( length($comment) == 0 ) {
+		print "You forgot to add comments! Please add a log message to your commit.\n";
+		$failures++;
+	}
+	elsif ( length($comment) < $minchars ) {
+		print "Comment must be at least $minchars characters.\n";
+		$failures++;
+	}
+}
+
+sub check_zones {
+
+	open CHANGES, "-|", ($svnlook, "changed", "-t", $txn, $repo);
+	my @changes = <CHANGES>;
+	close CHANGES;
+
+	foreach my $change (@changes) {
+		chomp $change;
+		if ($change =~ /^[AU]/) {
+			my $updated = ( $change =~ /^U/ ? 1 : 0 ); #Log if it is new or updated.
+			$change =~ s/^\S+\s+//; #Cut the update info off the front
+
+			if ($change =~ /(zone|rev)$/i) {
+
+				#This cuts out the file cleanly using File::Spec and then determines the domain name
+				my ($volume,$directories,$file) = File::Spec->splitpath( $change );
+				my $domain;
+				if ( $file =~ /([\w\-]+\.[a-z]+)\.i?zone$/i ) {
+					$domain = $1;
+				} elsif ($file =~ /((\d+\.)?\d+\.\d+)\.rev$/i) {
+					$domain = $1 . ".in-addr.arpa.";
+				} else {
+					print "Filename \"$change\" is not formatted correctly! (or my regex is bad)\n File not checked!\n";
+					$failures++;
+					next;
+				}
+
+				#Open a temp file, the svnlook cat and dump it to the temp file;
+				open TEMP, ">", $tmpfile or die "Unable to open tmp file $tmpfile, $!\n";
+				open CAT, "-|", ($svnlook, "cat", "-t", $txn, $repo, $change) or
+					die "Unable to check out $change; $!";
+				while (<CAT>) {
+					print TEMP $_;
+				}
+				close CAT or die "Unable to close pipe? $!";
+				close TEMP or die "Unable to close temp file $!";
+
+
+				###Make sure it passes a strict checkconf
+				if ( system ($chkzone, '-q', @chkflags, $domain, $tmpfile ) != 0 ) {
+					my $flags= join ' ', @chkflags;
+					print "Syntax error in file $change.\nCurrently set to strict processing, double check file.\n";
+					print `$chkzone $flags $domain $tmpfile`;
+					$failures++;
+				}
+
+
+				###This is where the expensive but awesome test for Serial increment goes.
+				my $newserial=0;
+				#First let's get the new serial.
+				open TEMP, "<", $tmpfile or die "Unable to open tmp file $tmpfile, $!\n";
+				while (<TEMP>){
+					if ( /(\d+)\s+;Serial/ ) {
+						$newserial = $1;
+						last;
+					}
+				}
+				close TEMP;
+
+				#Testing the serial, in elsif's to
+
+				if ( $newserial !~ /\d\d\d\d\d\d\d\d\d\d/ ) {
+					print "Unable to extract the serial from $change properly.\n";
+					print "Did you forget the \";Serial\" comment or malform it (YYYYMMDDXX)?\n";
+					print "Serial read as \"$newserial\".\n";
+					$failures++;
+				} elsif  ( $newserial !~ /$date\d\d/ ) {
+					print "Serial in $change does not match todays date! Did you update it?\n";
+					print "Serial \"$newserial\" should start with $date\n";
+					$failures++;
+				} elsif ( $updated ) { #Only for UPDATED zones, not added ones.
+					my $oldserial=0;
+
+					open CAT, "-|", ($svnlook, "cat", $repo, $change) or
+						die "Unable to check out latest revision of $change; $!";
+					while (<CAT>) {
+						if ( /(\d+)\s+;Serial/ ) {
+							$oldserial = $1;
+							last;
+						}
+					}
+					close CAT;
+
+					#Here goes this again, we need sanity & order (These DIE thought because they show broken code or somehow a broken zone was submitted CRAP!!!)
+					if ( $oldserial !~ /\d\d\d\d\d\d\d\d\d\d/ ) {
+						print "Unable to extract the OLD serial from $change properly.\nUh oh!\nSerial read as \"$oldserial\"";
+						$failures++;
+					} elsif ( $newserial <= $oldserial ) {
+						print "Serial for file $change not incremented!\n";
+						print "\"$newserial\" is not greater than \"$oldserial\"\n";
+						$failures++;
+					}
+				}
+
+
+
+			} else { #This else is for debugging...
+				print "Updated/Added file \"$change\" not checked, (not a zone or rev)\n";
+			}
+		}
+	}
+}
+
+
+
+MAIN: {
+	#Sanely set date
+	chomp( $date = `/usr/bin/date +%Y%m%d` );
+
+	&check_comment;
+	&check_zones;
+
+	#Clean up tmpfiles & exit
+	unlink($tmpfile);
+
+	#Print the number of errors and make the exit cone the amount of errors, IE only a clean run passes.
+	print "-------------------------\nYou had $failures failure(s).\n-------------------------\n";
+	exit($failures);
+
+}

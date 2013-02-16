@@ -1,0 +1,61 @@
+#!/bin/bash
+
+REPOS="$1"
+REV="$2"
+servers="3 4 2 1"
+
+
+/usr/perl5/5.8.4/bin/svnnotify \
+	--repos-path "$REPOS" \
+	--revision "$REV" \
+	--to sysadmin@domain.com \
+	--from svn@domain.com \
+	--reply-to sysadmin@domain.com \
+	--with-diff \
+	--svnlook /opt/csvn/bin/svnlook \
+	--sendmail /usr/sbin/sendmail \
+	--subject-prefix "DNS Change:"
+
+
+rollback() {
+	echo "Failure detected, rolling back" >&2
+	for i in $servers; do
+		/usr/bin/ssh bindserv$i 'svn update -rPREV /etc/named'
+		/usr/bin/ssh bindserv$i 'named-checkconf -z'
+		/usr/sbin/rndc -s bindserv$i reload
+	done
+	
+	exit 62
+}
+
+#Post commit submit!!!
+for i in $servers; do
+	/usr/bin/ssh bindserv$i 'svn update /etc/named'
+	RETUP=$?
+	if [ $RETUP -ne 0 ]; then
+		echo "Running SVN update on RMP$i has failed. Please manually update the system and verify problem!!" >&2
+		echo "DNS ON RMP$i IS NOT UPDATED!!!" >&2
+		echo "Exiting without rollback" >&2
+		exit 31
+	fi
+done	
+
+for i in $servers; do
+	/usr/bin/ssh bindserv$i 'named-checkconf -z'
+	RETCHECK=$?
+	if [ $RETCHECK -ne 0 ]; then
+		echo "Checkconf on RMP$i has FAILED!!!" >&2
+		rollback
+	fi
+done
+
+for i in $servers; do
+	/usr/sbin/rndc -s bindserv$i reload
+	RETLOAD=$?
+	if [ $RETLOAD -ne 0 ]; then
+		echo "RELOAD OF RMP$i FAILED? DNS NOT UPDATED!" >&2
+		rollback
+	fi
+done
+
+exit 0
